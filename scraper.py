@@ -125,12 +125,20 @@ async def click_load_more_until_complete(browser, year: int) -> list:
     context = await browser.new_context(user_agent=USER_AGENT)
     page = await context.new_page()
     
-    # JUCO URL pattern
-    url = f"https://247sports.com/Season/{year}-Football/CompositeJUCORecruitRankings/"
+    # --- FIX START: Updated URL to match modern 247Sports structure ---
+    url = f"https://247sports.com/Season/{year}-Football/CompositeRecruitRankings/?InstitutionGroup=JuniorCollege"
+    # --- FIX END ---
     
     try:
         await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-        await page.wait_for_timeout(2000)
+        
+        # --- FIX START: Wait for the list to hydrate ---
+        try:
+            await page.wait_for_selector(".rankings-page__list-item", timeout=10000)
+        except Exception:
+            print("⚠️ Timeout waiting for list items to hydrate (might be empty or layout changed)")
+        # --- FIX END ---
+
     except Exception as e:
         print(f"❌ Failed to load initial page for {year}: {e}")
         await context.close()
