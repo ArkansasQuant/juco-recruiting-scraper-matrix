@@ -202,63 +202,57 @@ async def navigate_to_recruiting_profile(page) -> bool:
 
 async def find_most_recent_hs_profile(page) -> tuple:
     """
-    FINAL VERSION: The institution list IS in the HTML, just need correct selector
+    DIAGNOSTIC: Dump HTML to see what Playwright actually sees
     """
     try:
         print(f"      🔍 DEBUG: Starting HS profile search...")
         
-        # Wait a bit for page to fully render
-        await page.wait_for_timeout(2000)
+        # Wait for page to load
+        await page.wait_for_timeout(3000)
         
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
         
-        # The institution list is in the HTML - try different selectors
-        selectors_to_try = [
-            'ul.institution-list a.profile-card__institution-list-link',
-            'ul.institution-list a',
-            '.institution-list a',
-            'div.institution-block ul li a'
-        ]
+        # Look for institution-block div
+        institution_block = soup.select_one('div.institution-block')
+        if institution_block:
+            print(f"      ✓ DEBUG: Found institution-block div!")
+            print(f"      → DEBUG: HTML inside institution-block:")
+            print(f"      {institution_block.prettify()[:500]}")
+        else:
+            print(f"      ❌ DEBUG: No div.institution-block found!")
         
-        institution_links = []
-        for selector in selectors_to_try:
-            institution_links = soup.select(selector)
-            if institution_links:
-                print(f"      ✓ DEBUG: Found {len(institution_links)} links using: {selector}")
-                break
+        # Look for ANY ul on the page
+        all_uls = soup.select('ul')
+        print(f"      → DEBUG: Found {len(all_uls)} total <ul> elements on page")
         
-        if not institution_links:
-            print(f"      ❌ DEBUG: No institution links found with any selector")
-            return (None, None)
+        # Look for institution-list
+        inst_lists = soup.select('.institution-list')
+        print(f"      → DEBUG: Found {len(inst_lists)} elements with class 'institution-list'")
         
-        # Print all links
-        for idx, link in enumerate(institution_links):
-            link_text = link.get_text(strip=True)
-            href = link.get('href', '')
-            print(f"      → DEBUG: Link #{idx+1}: '{link_text}' → {href[:60] if href else 'NO HREF'}...")
+        # Try to find ANY links with "(HS)" text
+        all_links = soup.select('a')
+        hs_links = [link for link in all_links if '(HS)' in link.get_text()]
+        print(f"      → DEBUG: Found {len(hs_links)} links containing '(HS)' text")
         
-        # Find first (HS) link
-        for link in institution_links:
-            link_text = link.get_text(strip=True)
-            
-            if '(HS)' in link_text:
-                hs_url = link.get('href', '')
-                if not hs_url:
-                    print(f"      ⚠️  DEBUG: Found HS text but no href")
-                    continue
-                    
+        for link in hs_links[:3]:
+            print(f"      → DEBUG: HS link: {link.get_text()[:50]} → {link.get('href', 'NO HREF')[:60]}")
+        
+        # If we found HS links directly, use them!
+        if hs_links:
+            link = hs_links[0]  # First (most recent) HS
+            hs_url = link.get('href', '')
+            if hs_url:
                 if hs_url.startswith('/'):
                     hs_url = f"https://247sports.com{hs_url}"
-                    
-                hs_name = link_text.replace('(HS)', '').strip()
+                hs_name = link.get_text().replace('(HS)', '').strip()
                 print(f"      ✅ DEBUG: Found HS profile!")
                 print(f"         Name: {hs_name}")
                 print(f"         URL: {hs_url}")
                 return (hs_url, hs_name)
         
-        print(f"      ⚠️  DEBUG: No (HS) link found in {len(institution_links)} links")
+        print(f"      ❌ DEBUG: No HS profile found")
         return (None, None)
         
     except Exception as e:
