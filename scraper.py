@@ -437,11 +437,12 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
     data['_date_priority'] = -1
     
     try:
-        # --- 1. PARSE JUCO PROFILE ---
+        # --- 1. LOAD JUCO PROFILE PAGE ---
+        # Everything is already on this page - no tab clicking needed!
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(1000)
-        await navigate_to_recruiting_profile(page)
+        await page.wait_for_timeout(2000)  # Wait for JavaScript to fully render the page
         
+        # --- 2. SCRAPE JUCO DATA DIRECTLY ---
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
@@ -476,7 +477,7 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
         
         data['Class'] = str(year)
         
-        # JUCO RANKINGS (Pass "JuniorCollege" as the institution check)
+        # JUCO RANKINGS
         juco_map = {"COMPOSITE": "Composite JUCO", "247SPORTS": "247 JUCO"}
         parse_rankings_section_robust(soup, data, juco_map, institution_check="JuniorCollege")
 
@@ -484,17 +485,21 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
         do_deep_dive = player_num <= DEEP_TIMELINE_LIMIT
         await parse_timeline(page, data, year, do_deep_dive)
 
-        # --- 2. FIND & PARSE HS PROFILE ---
+        # --- 3. NOW CLICK JUCO DROPDOWN TO GET HS PROFILE ---
+        # The dropdown is visible on initial page load
         hs_url, hs_name = await find_most_recent_hs_profile(page)
         
         if hs_url and hs_name:
             data['High School'] = hs_name
             try:
-                print(f"      → DEBUG: Navigating to HS profile: {hs_url[:60]}...")
-                # Navigate to HS Profile
+                print(f"      → DEBUG: Clicking HS profile link: {hs_name}")
+                print(f"      → DEBUG: Navigating to: {hs_url[:60]}...")
+                
+                # Click the HS link - it will automatically load the recruiting profile
                 await page.goto(hs_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(1000)
-                await navigate_to_recruiting_profile(page)
+                await page.wait_for_timeout(2000)  # Wait for page to fully load
+                
+                # NO NEED to click "View recruiting profile" - it auto-loads
                 
                 hs_html = await page.content()
                 hs_soup = BeautifulSoup(hs_html, 'html.parser')
@@ -509,7 +514,7 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
                             data['HS Class Year'] = clean_text(match.group(1))
                             print(f"      ✓ DEBUG: Found HS Class Year: {data['HS Class Year']}")
                 
-                # HS RANKINGS (Pass "HighSchool" as the institution check)
+                # HS RANKINGS
                 print(f"      → DEBUG: Parsing HS rankings...")
                 hs_map = {"COMPOSITE": "Composite HS", "247SPORTS": "247 HS"}
                 parse_rankings_section_robust(hs_soup, data, hs_map, institution_check="HighSchool")
