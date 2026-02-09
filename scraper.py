@@ -202,65 +202,38 @@ async def navigate_to_recruiting_profile(page) -> bool:
 
 async def find_most_recent_hs_profile(page) -> tuple:
     """
-    DEBUG VERSION: Clicks the institution dropdown to reveal the High School link.
-    FIXED: Actually clicks the button!
+    ALTERNATIVE APPROACH: Parse the institution list directly from HTML
+    The list exists in the HTML even when hidden - we don't need to click!
     """
     try:
         print(f"      🔍 DEBUG: Starting HS profile search...")
+        print(f"      → DEBUG: Parsing HTML directly (no button click needed)...")
         
-        # 1. Wait for the dropdown button to appear (up to 5 seconds)
-        print(f"      → DEBUG: Waiting for dropdown button to appear...")
-        try:
-            await page.wait_for_selector('button[data-js="institution-selector"]', timeout=5000)
-            print(f"      ✓ DEBUG: Dropdown button appeared!")
-        except Exception as e:
-            print(f"      ❌ DEBUG: Dropdown button never appeared: {e}")
-            return (None, None)
-        
-        # 2. NOW ACTUALLY CLICK THE BUTTON!
-        dropdown_button = page.locator('button[data-js="institution-selector"]')
-        button_count = await dropdown_button.count()
-        print(f"      → DEBUG: Found {button_count} dropdown buttons")
-        
-        if button_count == 0:
-            print(f"      ❌ DEBUG: Button disappeared")
-            return (None, None)
-        
-        print(f"      → DEBUG: Clicking dropdown button NOW...")
-        await dropdown_button.first.click()
-        print(f"      ✓ DEBUG: Button clicked!")
-        await page.wait_for_timeout(1000)  # Wait for dropdown animation
-        
-        # 3. Wait for the hidden class to be removed from institution-list
-        print(f"      → DEBUG: Waiting for institution list to become visible...")
-        try:
-            await page.wait_for_selector('ul.institution-list:not(.hidden)', timeout=3000)
-            print(f"      ✓ DEBUG: Institution list is now visible!")
-        except Exception as e:
-            print(f"      ⚠️  DEBUG: List may still be hidden: {e}")
-            # Continue anyway, try to parse
-        
-        # 4. Get the HTML and parse
+        # Get the HTML directly - the list is already there, just hidden
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
         
-        # 5. Find all institution links
+        # Find the institution list (even if it has 'hidden' class)
         institution_list = soup.select('ul.institution-list li a')
-        print(f"      → DEBUG: Found {len(institution_list)} total institution links")
+        print(f"      → DEBUG: Found {len(institution_list)} total institution links in HTML")
         
-        # 6. Print each link for debugging
+        # Print each link for debugging
         for idx, link in enumerate(institution_list):
             link_text = link.get_text(strip=True)
             href = link.get('href', '')
-            print(f"      → DEBUG: Link #{idx+1}: '{link_text}' → {href[:50]}...")
+            print(f"      → DEBUG: Link #{idx+1}: '{link_text}' → {href[:50] if href else 'NO HREF'}...")
         
-        # 7. Look for (HS) link
+        # Look for (HS) link
         for link in institution_list:
             link_text = link.get_text(strip=True)
             
             if '(HS)' in link_text:
                 hs_url = link.get('href', '')
+                if not hs_url:
+                    print(f"      ⚠️  DEBUG: Found HS text but no href: {link_text}")
+                    continue
+                    
                 if hs_url.startswith('/'):
                     hs_url = f"https://247sports.com{hs_url}"
                 hs_name = link_text.replace('(HS)', '').strip()
