@@ -1,704 +1,220 @@
-"""
-247Sports JUCO Recruiting Class Scraper - DEBUG VERSION
-Scrapes JUCO recruiting class data from 247Sports (2016-2027)
+# ENHANCED JAVASCRIPT FIX
+# 
+# Issue 1: HS dropdown still not working
+# Issue 2: Need to capture multiple 247 IDs (Base, JUCO, HS)
 
-DEBUG FEATURES:
-- Extensive logging for HS profile dropdown detection
-- Shows exactly what institution links are found
-- Helps diagnose why HS data isn't being scraped
-"""
+# SOLUTION 1: Force dropdown visibility with JavaScript
+# Instead of just clicking, we'll:
+# 1. Remove the 'hidden' class from the dropdown
+# 2. Make it visible with inline styles
+# 3. THEN parse the links
 
-import asyncio
-import csv
-import os
-import re
-import sys
-from datetime import datetime
-from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-YEARS = [int(os.getenv('SCRAPE_YEAR', '2024'))]
-OUTPUT_DIR = Path("output")
-TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
-MAX_CONCURRENT = 4
-DEEP_TIMELINE_LIMIT = 1000
-
-# Resume capability
-START_FROM_PLAYER = int(os.getenv('START_FROM', '0'))
-
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
-
-CSV_HEADERS = [
-    "247 ID", "Player Name", "Position", "Height", "Weight", "City, ST", "Class",
-    "Junior College", "High School", "HS Class Year",
-    "247 JUCO Stars", "247 JUCO Rating", "247 JUCO National Rank", 
-    "247 JUCO Position", "247 JUCO Position Rank",
-    "Composite JUCO Stars", "Composite JUCO Rating", "Composite JUCO National Rank",
-    "Composite JUCO Position", "Composite JUCO Position Rank",
-    "247 HS Stars", "247 HS Rating", "247 HS National Rank",
-    "247 HS Position", "247 HS Position Rank",
-    "Composite HS Stars", "Composite HS Rating", "Composite HS National Rank",
-    "Composite HS Position", "Composite HS Position Rank",
-    "Signed Date", "Signed Team", "Draft Date", "Draft Team",
-    "Recruiting Year", "Profile URL", "Scrape Date", "Data Source"
-]
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def extract_player_id(url: str) -> str:
-    match = re.search(r'/player/[^/]+-(\d+)/', url)
-    return match.group(1) if match else "NA"
-
-def clean_text(text: str) -> str:
-    if not text: return "NA"
-    # Replace non-breaking spaces and other whitespace
-    cleaned = text.strip().replace('\n', ' ').replace('\r', '').replace('\xa0', ' ')
-    return cleaned
-
-def normalize_height(height_str: str) -> str:
-    if not height_str or height_str == "NA": 
-        return "NA"
-    height_str = height_str.strip().strip("'\"")
-    if '-' in height_str or "'" in height_str or (len(height_str) <= 4 and any(c.isdigit() for c in height_str)):
-        return f"'{height_str}"
-    return height_str
-
-def parse_rank(text: str) -> str:
-    if not text: return "NA"
-    match = re.search(r'#?(\d+)', text)
-    return match.group(1) if match else "NA"
-
-def normalize_date(date_str: str) -> str:
-    if not date_str: return "NA"
-    date_str = clean_text(date_str)
-    formats = ["%m/%d/%Y", "%b %d, %Y", "%B %d, %Y"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).strftime("%m/%d/%Y")
-        except ValueError:
-            continue
-    return date_str
-
-def is_date_valid_for_class(date_str: str, recruiting_year: int) -> bool:
-    if date_str == "NA": return False
-    try:
-        dt = datetime.strptime(date_str, "%m/%d/%Y")
-        cutoff_date = datetime(recruiting_year, 9, 1)
-        return dt < cutoff_date
-    except:
-        return True
-
-def append_to_csv(filename: Path, players: list):
-    file_exists = filename.exists()
-    with open(filename, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(players)
-
-# =============================================================================
-# LOAD MORE FUNCTIONALITY
-# =============================================================================
-
-async def click_load_more_until_complete(browser, year: int) -> list:
-    print(f"\n📋 Loading all JUCO players for {year}...")
-    context = await browser.new_context(user_agent=USER_AGENT)
-    page = await context.new_page()
-    
-    # Correct Modern URL for JUCO Rankings
-    url = f"https://247sports.com/Season/{year}-Football/CompositeRecruitRankings/?InstitutionGroup=JuniorCollege"
-    
-    try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-        try:
-            await page.wait_for_selector(".rankings-page__list-item", timeout=10000)
-        except Exception:
-            print("⚠️ Timeout waiting for list items to hydrate")
-    except Exception as e:
-        print(f"❌ Failed to load initial page for {year}: {e}")
-        await context.close()
-        return []
-
-    selectors = ["li.rankings-page__list-item", "li.recruit", ".rankings-page__container ul > li"]
-    valid_selector = None
-    for selector in selectors:
-        count = await page.locator(selector).count()
-        if count > 0:
-            valid_selector = selector
-            print(f"  ✓ Found {count} players using selector: '{selector}'")
-            break
-            
-    if not valid_selector:
-        print(f"⚠️  No players found")
-        await context.close()
-        return []
-
-    click_count = 0
-    max_clicks = 500 if not TEST_MODE else 3
-    
-    while click_count < max_clicks:
-        current_players = await page.locator(valid_selector).count()
-        load_more_button = page.locator('a.load-more, button.load-more, a.rankings-page__showmore, a:has-text("Load More")')
-        try:
-            if await load_more_button.count() > 0 and await load_more_button.first.is_visible():
-                print(f"  → Click #{click_count + 1}: {current_players} players loaded...")
-                await load_more_button.first.click()
-                await page.wait_for_timeout(1500)
-                click_count += 1
-            else:
-                print(f"  ✓ All players loaded!")
-                break
-        except Exception:
-            break
-    
-    print(f"\n🔗 Extracting player profile URLs...")
-    player_links = await page.locator(f'{valid_selector} a.rankings-page__name-link, {valid_selector} a.recruit').all()
-    if not player_links:
-         player_links = await page.locator(f'{valid_selector} a[href*="/player/"]').all()
-
-    player_urls = []
-    for link in player_links:
-        href = await link.get_attribute('href')
-        if href and '/player/' in href:
-            if href.startswith('/'): href = f"https://247sports.com{href}"
-            player_urls.append(href)
-    
-    player_urls = list(dict.fromkeys(player_urls))
-    print(f"  ✓ Found {len(player_urls)} player profiles")
-    
-    if TEST_MODE and len(player_urls) > 50:
-        player_urls = player_urls[:50]
-        print(f"  ℹ️  TEST MODE: Limited to 50 players")
-    
-    await context.close()
-    return player_urls
-
-# =============================================================================
-# PROFILE PARSING
-# =============================================================================
-
-async def navigate_to_recruiting_profile(page) -> bool:
-    """Ensures we are on the 'Recruiting' tab of the profile"""
-    try:
-        recruiting_link = page.locator('a:has-text("View recruiting profile"), a:has-text("Recruiting Profile")')
-        if await recruiting_link.count() > 0:
-            await recruiting_link.first.click()
-            await page.wait_for_load_state('domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(1000)
-            return True
-        return False
-    except:
-        return False
-
-async def find_most_recent_hs_profile(page) -> tuple:
+async def find_most_recent_hs_profile_ENHANCED(page) -> tuple:
     """
-    JavaScript-based dropdown clicking to find HS profile.
-    Uses JavaScript execution instead of Playwright's native click.
+    Enhanced version that FORCES the dropdown to be visible using JavaScript
     """
     try:
-        print(f"      🔍 DEBUG: Starting HS profile search...")
+        print(f"      🔍 DEBUG: Starting HS profile search (ENHANCED)...")
         
-        # Wait for page to fully render
         await page.wait_for_timeout(2000)
         
-        # Try to click the institution dropdown using JavaScript
-        print(f"      → DEBUG: Attempting to click institution dropdown with JavaScript...")
-        try:
-            # Use JavaScript to click the button directly
-            clicked = await page.evaluate('''() => {
-                const button = document.querySelector('button[data-js="institution-selector"]');
-                if (button) {
-                    button.click();
-                    return true;
-                }
-                return false;
-            }''')
-            
-            if clicked:
-                print(f"      ✓ DEBUG: JavaScript click successful!")
-                await page.wait_for_timeout(1500)  # Wait for dropdown animation
-            else:
-                print(f"      ⚠️  DEBUG: Button not found in DOM")
-                return (None, None)
-                
-        except Exception as e:
-            print(f"      ❌ DEBUG: JavaScript click failed: {e}")
-            return (None, None)
+        # STEP 1: Try to click button first
+        print(f"      → DEBUG: Attempting JavaScript click...")
+        clicked = await page.evaluate('''() => {
+            const button = document.querySelector('button[data-js="institution-selector"]');
+            if (button) {
+                button.click();
+                return true;
+            }
+            return false;
+        }''')
         
-        # Now get the HTML and look for HS links
+        if clicked:
+            print(f"      ✓ DEBUG: Button clicked!")
+            await page.wait_for_timeout(1500)
+        else:
+            print(f"      ⚠️  DEBUG: Button not found, trying to force visibility...")
+        
+        # STEP 2: FORCE the dropdown to be visible
+        print(f"      → DEBUG: Forcing dropdown visibility with JavaScript...")
+        forced = await page.evaluate('''() => {
+            // Find the institution list
+            const list = document.querySelector('ul.institution-list');
+            if (list) {
+                // Remove 'hidden' class
+                list.classList.remove('hidden');
+                // Force display
+                list.style.display = 'block';
+                list.style.visibility = 'visible';
+                list.style.opacity = '1';
+                return true;
+            }
+            return false;
+        }''')
+        
+        if forced:
+            print(f"      ✓ DEBUG: Dropdown forced visible!")
+            await page.wait_for_timeout(500)
+        else:
+            print(f"      ⚠️  DEBUG: Could not find institution-list")
+        
+        # STEP 3: Now parse the HTML
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Look for institution list
-        institution_links = soup.select('ul.institution-list a')
-        print(f"      → DEBUG: Found {len(institution_links)} institution links after dropdown click")
+        # Try multiple selectors
+        selectors = [
+            'ul.institution-list a',
+            '.institution-list a',
+            'div.institution-block ul a',
+            'a[href*="/high-school-"]'
+        ]
         
-        # Print all links for debugging
+        institution_links = []
+        for selector in selectors:
+            institution_links = soup.select(selector)
+            if institution_links:
+                print(f"      ✓ DEBUG: Found {len(institution_links)} links with selector: {selector}")
+                break
+        
+        # Print all links
         for idx, link in enumerate(institution_links):
             link_text = link.get_text(strip=True)
             href = link.get('href', '')
             print(f"      → DEBUG: Link #{idx+1}: '{link_text}' → {href[:60] if href else 'NO HREF'}")
         
-        # Find first (HS) link
+        # Find (HS) link and extract HS ID
         for link in institution_links:
             link_text = link.get_text(strip=True)
             
             if '(HS)' in link_text:
                 hs_url = link.get('href', '')
                 if not hs_url:
-                    print(f"      ⚠️  DEBUG: Found HS text but no href")
                     continue
                     
                 if hs_url.startswith('/'):
                     hs_url = f"https://247sports.com{hs_url}"
                     
                 hs_name = link_text.replace('(HS)', '').strip()
+                
+                # EXTRACT HS ID from URL
+                hs_id = None
+                hs_id_match = re.search(r'/high-school-(\d+)', hs_url)
+                if hs_id_match:
+                    hs_id = hs_id_match.group(1)
+                
                 print(f"      ✅ DEBUG: Found HS profile!")
                 print(f"         Name: {hs_name}")
                 print(f"         URL: {hs_url}")
-                return (hs_url, hs_name)
+                print(f"         HS ID: {hs_id}")
+                
+                return (hs_url, hs_name, hs_id)
         
-        print(f"      ⚠️  DEBUG: No (HS) link found in {len(institution_links)} links")
-        return (None, None)
+        print(f"      ⚠️  DEBUG: No (HS) link found")
+        return (None, None, None)
         
     except Exception as e:
         print(f"      ❌ DEBUG: Exception: {e}")
         import traceback
         traceback.print_exc()
-        return (None, None)
+        return (None, None, None)
 
 
-async def navigate_to_juco_profile_from_cover(page) -> bool:
+# SOLUTION 2: Extract all IDs from the institution links
+
+async def extract_all_institution_ids(page) -> dict:
     """
-    For cover profiles (2022 and earlier), click the JUCO link using JavaScript.
-    Returns True if successfully navigated, False otherwise.
+    Extract all 247 IDs for a player across all institutions.
+    Returns dict with keys: 'base', 'juco', 'hs', 'colleges'
     """
     try:
-        print(f"      → DEBUG: Checking if this is a cover profile...")
+        print(f"      → DEBUG: Extracting all institution IDs...")
         
-        # Wait for page to render
-        await page.wait_for_timeout(2000)
+        # Force dropdown visible
+        await page.evaluate('''() => {
+            const list = document.querySelector('ul.institution-list');
+            if (list) {
+                list.classList.remove('hidden');
+                list.style.display = 'block';
+            }
+        }''')
         
-        # Try to click JUCO dropdown using JavaScript
-        print(f"      → DEBUG: Attempting to click JUCO dropdown with JavaScript...")
-        try:
-            clicked = await page.evaluate('''() => {
-                // Look for the JUCO button/link in the institution selector
-                const jucoButton = document.querySelector('a[href*="JUCO"], button:has-text("JUCO")');
-                if (jucoButton) {
-                    jucoButton.click();
-                    return true;
-                }
-                return false;
-            }''')
-            
-            if clicked:
-                print(f"      ✓ DEBUG: Clicked JUCO button, waiting for dropdown...")
-                await page.wait_for_timeout(1500)
-            else:
-                print(f"      → DEBUG: No JUCO button found (might already be on JUCO profile)")
-                
-        except Exception as e:
-            print(f"      → DEBUG: JUCO button click attempt: {e}")
+        await page.wait_for_timeout(500)
         
-        # Now look for JUCO profile link in the dropdown
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Look for links containing (JUCO) and /junior-college-
-        all_links = soup.select('a')
+        ids = {
+            'base': None,
+            'juco': None,
+            'hs': None,
+            'colleges': []
+        }
+        
+        # Get base ID from current URL
+        current_url = page.url
+        base_match = re.search(r'/player/[^/]+-(\d+)', current_url)
+        if base_match:
+            ids['base'] = base_match.group(1)
+        
+        # Parse all institution links
+        all_links = soup.select('a[href*="/player/"]')
+        
         for link in all_links:
-            link_text = link.get_text(strip=True)
             href = link.get('href', '')
+            text = link.get_text(strip=True)
             
-            if '(JUCO)' in link_text and '/junior-college-' in href:
-                juco_url = href
-                if juco_url.startswith('/'):
-                    juco_url = f"https://247sports.com{juco_url}"
-                
-                print(f"      ✓ DEBUG: Found JUCO profile link: {link_text}")
-                print(f"      → DEBUG: Navigating to: {juco_url[:70]}...")
-                
-                await page.goto(juco_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(2000)
-                print(f"      ✓ DEBUG: Successfully loaded JUCO recruiting profile")
-                return True
+            # JUCO ID
+            if '/junior-college-' in href:
+                juco_match = re.search(r'/junior-college-(\d+)', href)
+                if juco_match and not ids['juco']:
+                    ids['juco'] = juco_match.group(1)
+                    print(f"      → Found JUCO ID: {ids['juco']}")
+            
+            # HS ID
+            elif '/high-school-' in href:
+                hs_match = re.search(r'/high-school-(\d+)', href)
+                if hs_match and not ids['hs']:
+                    ids['hs'] = hs_match.group(1)
+                    print(f"      → Found HS ID: {ids['hs']}")
+            
+            # College IDs (can be multiple)
+            elif '/college-' in href and '(NCAA)' in text:
+                college_match = re.search(r'/college-(\d+)', href)
+                if college_match:
+                    college_id = college_match.group(1)
+                    if college_id not in ids['colleges']:
+                        ids['colleges'].append(college_id)
+                        print(f"      → Found College ID: {college_id} ({text})")
         
-        print(f"      → DEBUG: No JUCO profile link found (might already be on correct profile)")
-        return True
+        print(f"      ✓ DEBUG: IDs extracted - Base: {ids['base']}, JUCO: {ids['juco']}, HS: {ids['hs']}, Colleges: {len(ids['colleges'])}")
+        return ids
         
     except Exception as e:
-        print(f"      ⚠️  DEBUG: Error in navigate_to_juco_profile_from_cover: {e}")
-        return True  # Continue anyway
+        print(f"      ⚠️  DEBUG: Error extracting IDs: {e}")
+        return {'base': None, 'juco': None, 'hs': None, 'colleges': []}
 
-async def parse_timeline(page, data, year, do_deep_dive: bool):
-    try:
-        html = await page.content()
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        items = soup.select('.timeline-item, .timeline li, ul.timeline > li, .vertical-timeline-element-content')
-        for item in items:
-            item_text = clean_text(item.get_text())
-            if 'draft' in item_text.lower():
-                date_match = re.search(r'([A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', item_text)
-                if date_match and data['Draft Date'] == "NA":
-                     data['Draft Date'] = normalize_date(date_match.group(1))
-                team_match = re.search(r'(?:Draft[:\s]+)?([A-Z][A-Za-z0-9\s\.]+?)\s+(?:select|pick)', item_text, re.IGNORECASE)
-                if team_match and data['Draft Team'] == "NA":
-                    team_name = clean_text(team_match.group(1))
-                    team_name = re.sub(r'^Draft\s*', '', team_name, flags=re.IGNORECASE).strip()
-                    if team_name and team_name.lower() not in ['draft']:
-                        data['Draft Team'] = team_name
-            
-            item_priority = 0
-            if 'commitment' in item_text.lower() or 'committed' in item_text.lower() or 'commits to' in item_text.lower():
-                 item_priority = 100
-            elif 'signed' in item_text.lower() or 'signing' in item_text.lower():
-                 item_priority = 1
-            
-            if item_priority > 0:
-                date_match = re.search(r'([A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', item_text)
-                found_date = normalize_date(date_match.group(1)) if date_match else "NA"
-                if found_date != "NA" and is_date_valid_for_class(found_date, year):
-                    current_priority = data.get('_date_priority', -1)
-                    if item_priority > current_priority:
-                        data['Signed Date'] = found_date
-                        data['_date_priority'] = item_priority
-                        team_match = re.search(r'(?:to|with|at|commits to)\s+([A-Z][^,.]+)', item_text)
-                        if team_match:
-                            data['Signed Team'] = clean_text(team_match.group(1))
-        
-        if do_deep_dive:
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await page.wait_for_timeout(1500)
-            see_all_link = page.locator('a[href*="TimelineEvents"]')
-            if await see_all_link.count() > 0:
-                href = await see_all_link.first.get_attribute('href')
-                if href:
-                    full_timeline_url = f"https://247sports.com{href}" if href.startswith('/') else href
-                    try:
-                        await page.goto(full_timeline_url, wait_until='domcontentloaded', timeout=15000)
-                        page_count = 0
-                        while page_count < 10:
-                            html = await page.content()
-                            soup = BeautifulSoup(html, 'html.parser')
-                            full_items = soup.select('ul.timeline-event-index_lst li')
-                            for item in full_items:
-                                item_text = clean_text(item.get_text())
-                                item_priority = 0
-                                if 'commitment' in item_text.lower() or 'committed' in item_text.lower() or 'commits to' in item_text.lower():
-                                     item_priority = 100
-                                elif 'signed' in item_text.lower() or 'signing' in item_text.lower():
-                                     item_priority = 1
-                                if item_priority > 0:
-                                    date_match = re.search(r'([A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', item_text)
-                                    found_date = normalize_date(date_match.group(1)) if date_match else "NA"
-                                    if found_date != "NA" and is_date_valid_for_class(found_date, year):
-                                        current_priority = data.get('_date_priority', -1)
-                                        if item_priority > current_priority:
-                                            data['Signed Date'] = found_date
-                                            data['_date_priority'] = item_priority
-                                            team_match = re.search(r'(?:to|with|at|commits to)\s+([A-Z][^,.]+)', item_text)
-                                            if team_match:
-                                                data['Signed Team'] = clean_text(team_match.group(1))
-                                            if item_priority == 100: return
-                            next_button = page.locator('li.next_itm a')
-                            if await next_button.count() > 0 and await next_button.is_visible():
-                                await next_button.click()
-                                await page.wait_for_timeout(1000)
-                                page_count += 1
-                            else: break
-                    except Exception: pass
-    except Exception: pass
 
-# --- FIXED RANKING PARSER ---
-def parse_rankings_section_robust(soup, data, prefix_map, institution_check=None):
-    """
-    Robust ranking parser that handles the 247Sports Composite headers
-    and extracts ranks even if specific tags (like <strong>) are missing.
-    """
-    ranking_sections = soup.select('section.rankings, section.rankings-section, div.ranking-section')
-    
-    for section in ranking_sections:
-        header = section.select_one('.rankings-header h3, h3.title, h3')
-        if not header: continue
-        
-        # Upper case and clean to handle "®" or other symbols
-        header_text = clean_text(header.get_text()).upper()
-        
-        prefix = None
-        # Robust Header Matching
-        if "COMPOSITE" in header_text:
-            prefix = prefix_map.get("COMPOSITE")
-        elif "247SPORTS" in header_text and "COMPOSITE" not in header_text:
-            prefix = prefix_map.get("247SPORTS")
-            
-        if not prefix: continue
-        
-        # Stars
-        stars = section.select('span.icon-starsolid.yellow, i.icon-starsolid.yellow')
-        if stars: data[f'{prefix} Stars'] = str(min(len(stars), 5))
-        
-        # Rating
-        rating_elem = section.select_one('.rank-block, .score, .rating')
-        if rating_elem:
-            rating_text = clean_text(rating_elem.get_text())
-            rating_match = re.search(r'(\d+(?:\.\d+)?)', rating_text)
-            if rating_match: data[f'{prefix} Rating'] = rating_match.group(1)
+# USAGE IN parse_profile():
+#
+# # After loading JUCO profile:
+# ids = await extract_all_institution_ids(page)
+# data['247 Base ID'] = ids['base'] or "NA"
+# data['247 JUCO ID'] = ids['juco'] or "NA"
+# data['247 HS ID'] = ids['hs'] or "NA"
+# data['247 College IDs'] = ','.join(ids['colleges']) if ids['colleges'] else "NA"
+#
+# # For HS profile finding:
+# hs_url, hs_name, hs_id = await find_most_recent_hs_profile_ENHANCED(page)
+# if hs_id:
+#     data['247 HS ID'] = hs_id
 
-        # Ranks
-        ranks_list = section.select_one('ul.ranks-list')
-        if ranks_list:
-            for li in ranks_list.select('li'):
-                pos_node = li.select_one('b')
-                link_tag = li.select_one('a')
-                
-                if link_tag:
-                    href = link_tag.get('href', '')
-                    
-                    # EXTRACT RANK TEXT ROBUSTLY (Try <strong>, then fallback to <a> text)
-                    rank_node = link_tag.select_one('strong')
-                    rank_text_raw = rank_node.get_text() if rank_node else link_tag.get_text()
-                    rank_val = parse_rank(rank_text_raw)
 
-                    # Position Rank
-                    if 'Position=' in href:
-                        if pos_node: 
-                            data[f'{prefix} Position'] = clean_text(pos_node.get_text())
-                        data[f'{prefix} Position Rank'] = rank_val
-                    
-                    # Skip State Ranks
-                    elif 'State=' in href or 'state=' in href:
-                        continue
-                    
-                    # National Rank (Checks InstitutionGroup if provided)
-                    elif institution_check and f'InstitutionGroup={institution_check}' in href:
-                         data[f'{prefix} National Rank'] = rank_val
-
-async def parse_profile(page, url: str, year: int, player_num: int, total: int) -> dict:
-    data = {header: "NA" for header in CSV_HEADERS}
-    data['Profile URL'] = url
-    data['Recruiting Year'] = str(year)
-    data['Scrape Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    data['Data Source'] = '247Sports JUCO'
-    data['_date_priority'] = -1
-    
-    try:
-        # --- 1. LOAD INITIAL PROFILE PAGE ---
-        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(2000)
-        
-        # --- 2. CHECK FOR COVER PROFILE (2022 and earlier) ---
-        # Navigate to JUCO-specific profile if needed
-        await navigate_to_juco_profile_from_cover(page)
-        
-        # --- 3. NOW SCRAPE JUCO DATA ---
-        html = await page.content()
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        data['247 ID'] = extract_player_id(url)
-        
-        # Header Info
-        name_elem = soup.select_one('.name') or soup.select_one('h1.name')
-        if name_elem: data['Player Name'] = clean_text(name_elem.get_text())
-        
-        all_header_items = soup.select('.metrics-list li') + soup.select('.details li') + soup.select('ul.vitals li')
-        for item in all_header_items:
-            text = item.get_text(strip=True)
-            if 'Pos' in text or 'Position' in text:
-                match = re.search(r'(?:Pos|Position)[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['Position'] = clean_text(match.group(1))
-            elif 'Height' in text:
-                match = re.search(r'Height[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['Height'] = normalize_height(match.group(1))
-            elif 'Weight' in text:
-                match = re.search(r'Weight[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['Weight'] = clean_text(match.group(1))
-            elif 'Junior College' in text:
-                match = re.search(r'Junior College[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['Junior College'] = clean_text(match.group(1))
-            elif 'Home Town' in text or 'Hometown' in text or 'City' in text:
-                match = re.search(r'(?:Home Town|Hometown|City)[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['City, ST'] = clean_text(match.group(1))
-            elif 'Class' in text:
-                match = re.search(r'Class[:\s]*(.*)', text, re.IGNORECASE)
-                if match: data['Class'] = clean_text(match.group(1))
-        
-        data['Class'] = str(year)
-        
-        # JUCO RANKINGS
-        juco_map = {"COMPOSITE": "Composite JUCO", "247SPORTS": "247 JUCO"}
-        parse_rankings_section_robust(soup, data, juco_map, institution_check="JuniorCollege")
-
-        # Timeline
-        do_deep_dive = player_num <= DEEP_TIMELINE_LIMIT
-        await parse_timeline(page, data, year, do_deep_dive)
-
-        # --- 3. NOW CLICK JUCO DROPDOWN TO GET HS PROFILE ---
-        # The dropdown is visible on initial page load
-        hs_url, hs_name = await find_most_recent_hs_profile(page)
-        
-        if hs_url and hs_name:
-            data['High School'] = hs_name
-            try:
-                print(f"      → DEBUG: Clicking HS profile link: {hs_name}")
-                print(f"      → DEBUG: Navigating to: {hs_url[:60]}...")
-                
-                # Click the HS link - it will automatically load the recruiting profile
-                await page.goto(hs_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(2000)  # Wait for page to fully load
-                
-                # NO NEED to click "View recruiting profile" - it auto-loads
-                
-                hs_html = await page.content()
-                hs_soup = BeautifulSoup(hs_html, 'html.parser')
-                
-                # HS Class Year
-                hs_header_items = hs_soup.select('.metrics-list li') + hs_soup.select('.details li') + hs_soup.select('ul.vitals li')
-                for item in hs_header_items:
-                    text = item.get_text(strip=True)
-                    if 'Class' in text:
-                        match = re.search(r'Class[:\s]*(.*)', text, re.IGNORECASE)
-                        if match: 
-                            data['HS Class Year'] = clean_text(match.group(1))
-                            print(f"      ✓ DEBUG: Found HS Class Year: {data['HS Class Year']}")
-                
-                # HS RANKINGS
-                print(f"      → DEBUG: Parsing HS rankings...")
-                hs_map = {"COMPOSITE": "Composite HS", "247SPORTS": "247 HS"}
-                parse_rankings_section_robust(hs_soup, data, hs_map, institution_check="HighSchool")
-                print(f"      ✓ DEBUG: HS Rankings - 247: {data['247 HS Stars']}⭐ / Composite: {data['Composite HS Stars']}⭐")
-                
-            except Exception as e:
-                print(f"      ❌ DEBUG: Could not load HS profile: {e}")
-
-        # Fallback for Signed Team
-        if data['Signed Team'] == "NA":
-            commit_banner = soup.select_one('.commit-banner, .commitment')
-            if commit_banner:
-                team_elem = commit_banner.select_one('span, a')
-                if team_elem:
-                    team_text = clean_text(team_elem.get_text())
-                    if team_text.lower() not in ['committed', 'commitment', 'signed']:
-                        data['Signed Team'] = team_text
-        
-        return data
-        
-    except Exception as e:
-        print(f"    ❌ Error parsing {data.get('Player Name', 'Unknown')}: {e}")
-        return data
-
-# =============================================================================
-# CONCURRENT SCRAPING
-# =============================================================================
-
-async def scrape_player_batch(browser, urls: list, year: int, batch_num: int, total_players: int) -> list:
-    tasks = []
-    context = await browser.new_context(user_agent=USER_AGENT)
-    for i, url in enumerate(urls):
-        page = await context.new_page()
-        player_num = batch_num * MAX_CONCURRENT + i + 1
-        tasks.append(scrape_player(page, url, year, player_num, total_players))
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    await context.close()
-    valid_results = []
-    for result in results:
-        if isinstance(result, dict):
-            if '_date_priority' in result: del result['_date_priority']
-            valid_results.append(result)
-    return valid_results
-
-async def scrape_player(page, url: str, year: int, player_num: int, total: int) -> dict:
-    try:
-        print(f"  [{player_num}/{total}] {url.split('/')[-2]}")
-        data = await parse_profile(page, url, year, player_num, total)
-        if data['Player Name'] != "NA":
-            deep_marker = "🔍" if player_num <= DEEP_TIMELINE_LIMIT else "⚡"
-            hs_marker = "+" if data['High School'] != "NA" else ""
-            print(f"    ✓ {deep_marker}{hs_marker} {data['Player Name']} - JUCO: {data['Composite JUCO Stars']}⭐ / HS: {data['Composite HS Stars']}⭐")
-        return data
-    except Exception as e:
-        print(f"    ❌ Error: {e}")
-        return {header: "NA" for header in CSV_HEADERS}
-    finally:
-        await page.close()
-
-# =============================================================================
-# MAIN SCRAPER
-# =============================================================================
-
-async def scrape_year(browser, year: int) -> list:
-    print(f"\n{'='*80}")
-    print(f"🎓 SCRAPING {year} JUCO RECRUITING CLASS (DEBUG MODE)")
-    print(f"{'='*80}")
-    player_urls = await click_load_more_until_complete(browser, year)
-    if not player_urls:
-        print(f"  ❌ No players found for {year}")
-        return []
-    if START_FROM_PLAYER > 0:
-        print(f"  ⏩ Resuming from player #{START_FROM_PLAYER}")
-        player_urls = player_urls[START_FROM_PLAYER:]
-    
-    print(f"\n🔄 Scraping {len(player_urls)} player profiles...")
-    year_range = f"{min(YEARS)}-{max(YEARS)}" if len(YEARS) > 1 else str(YEARS[0])
-    timestamp = datetime.now().strftime('%Y%m%d')
-    filename = OUTPUT_DIR / f"juco_recruiting_class_{year_range}_{timestamp}.csv"
-    
-    all_data = []
-    batch_buffer = []
-    for i in range(0, len(player_urls), MAX_CONCURRENT):
-        batch = player_urls[i:i + MAX_CONCURRENT]
-        batch_num = i // MAX_CONCURRENT
-        print(f"\n  📦 Batch {batch_num + 1}/{(len(player_urls) + MAX_CONCURRENT - 1) // MAX_CONCURRENT}")
-        batch_data = await scrape_player_batch(browser, batch, year, batch_num, len(player_urls))
-        all_data.extend(batch_data)
-        batch_buffer.extend(batch_data)
-        if len(batch_buffer) >= 100:
-            append_to_csv(filename, batch_buffer)
-            print(f"    💾 Saved {len(batch_buffer)} players to CSV")
-            batch_buffer = []
-        print(f"    → Progress: {len(all_data)}/{len(player_urls)} players")
-    
-    if batch_buffer:
-        append_to_csv(filename, batch_buffer)
-        print(f"    💾 Saved final {len(batch_buffer)} players to CSV")
-    print(f"\n✅ Completed {year}: {len(all_data)} players scraped")
-    return all_data
-
-async def main():
-    print("\n" + "="*80)
-    print("🏈 247SPORTS JUCO SCRAPER - DEBUG VERSION")
-    print("="*80)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        all_players = []
-        for year in YEARS:
-            year_data = await scrape_year(browser, year)
-            all_players.extend(year_data)
-        await browser.close()
-    if not all_players:
-        print("\n❌ CRITICAL: No data scraped.")
-        sys.exit(1)
-    print(f"\n✅ SCRAPING COMPLETE! Total Players: {len(all_players)}")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        print(f"\n❌ FATAL ERROR: {e}")
-        sys.exit(1)
+# UPDATE CSV_HEADERS to include:
+CSV_HEADERS = [
+    "247 Base ID", "247 JUCO ID", "247 HS ID", "247 College IDs",
+    "Player Name", "Position", "Height", "Weight", "City, ST", "Class",
+    # ... rest of headers ...
+]
