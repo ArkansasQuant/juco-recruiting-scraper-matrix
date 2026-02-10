@@ -1,12 +1,11 @@
 """
-247Sports JUCO Recruiting Class Scraper - FINAL PRODUCTION VERSION
+247Sports JUCO Recruiting Class Scraper - DEBUG VERSION
 Scrapes JUCO recruiting class data from 247Sports (2016-2027)
 
-FEATURES:
-- CORRECTLY opens the "Institution" dropdown to find the High School profile
-- Handles "247SPORTS COMPOSITE®JUCO" headers
-- Scrapes both JUCO and HS ratings/rankings
-- Resume capability & Incremental saving
+DEBUG FEATURES:
+- Extensive logging for HS profile dropdown detection
+- Shows exactly what institution links are found
+- Helps diagnose why HS data isn't being scraped
 """
 
 import asyncio
@@ -62,7 +61,7 @@ def extract_player_id(url: str) -> str:
 
 def clean_text(text: str) -> str:
     if not text: return "NA"
-    # Replace non-breaking spaces, returns, and other invisible characters
+    # Replace non-breaking spaces and other whitespace
     cleaned = text.strip().replace('\n', ' ').replace('\r', '').replace('\xa0', ' ')
     return cleaned
 
@@ -203,52 +202,146 @@ async def navigate_to_recruiting_profile(page) -> bool:
 
 async def find_most_recent_hs_profile(page) -> tuple:
     """
-    Finds the HS profile by physically clicking the institution dropdown
-    and waiting for the list to appear.
+    JavaScript-based dropdown clicking to find HS profile.
+    Uses JavaScript execution instead of Playwright's native click.
     """
     try:
-        # 1. Locate the dropdown button (The text usually says 'Junior College' or current school)
-        dropdown_btn = page.locator('button[data-js="institution-selector"], .institution-selector')
+        print(f"      🔍 DEBUG: Starting HS profile search...")
         
-        if await dropdown_btn.count() > 0 and await dropdown_btn.is_visible():
-            # Click to toggle
-            await dropdown_btn.first.click()
+        # Wait for page to fully render
+        await page.wait_for_timeout(2000)
+        
+        # Try to click the institution dropdown using JavaScript
+        print(f"      → DEBUG: Attempting to click institution dropdown with JavaScript...")
+        try:
+            # Use JavaScript to click the button directly
+            clicked = await page.evaluate('''() => {
+                const button = document.querySelector('button[data-js="institution-selector"]');
+                if (button) {
+                    button.click();
+                    return true;
+                }
+                return false;
+            }''')
             
-            # 2. Wait for the list to appear (animation)
-            list_selector = 'ul.institution-list'
-            try:
-                await page.wait_for_selector(list_selector, state='visible', timeout=2000)
-            except:
-                pass # Proceed anyway, it might be open
-
-            # 3. Parse the links from the NOW VISIBLE list
-            # We look for links containing "(HS)" text
-            hs_link_locator = page.locator(f'{list_selector} li a:has-text("(HS)")')
-            
-            if await hs_link_locator.count() > 0:
-                # Get the first one (usually the most recent HS entry, e.g. Colonia)
-                url = await hs_link_locator.first.get_attribute('href')
-                text = await hs_link_locator.first.text_content()
+            if clicked:
+                print(f"      ✓ DEBUG: JavaScript click successful!")
+                await page.wait_for_timeout(1500)  # Wait for dropdown animation
+            else:
+                print(f"      ⚠️  DEBUG: Button not found in DOM")
+                return (None, None)
                 
-                if url:
-                    full_url = f"https://247sports.com{url}" if url.startswith('/') else url
-                    hs_name = text.replace('(HS)', '').strip()
-                    return (full_url, hs_name)
+        except Exception as e:
+            print(f"      ❌ DEBUG: JavaScript click failed: {e}")
+            return (None, None)
         
-        else:
-            # FALLBACK: Check for a direct link if no dropdown exists
-            direct_hs = page.locator('a:has-text("(HS)")')
-            if await direct_hs.count() > 0:
-                url = await direct_hs.first.get_attribute('href')
-                text = await direct_hs.first.text_content()
-                full_url = f"https://247sports.com{url}" if url.startswith('/') else url
-                hs_name = text.replace('(HS)', '').strip()
-                return (full_url, hs_name)
-
+        # Now get the HTML and look for HS links
+        html = await page.content()
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Look for institution list
+        institution_links = soup.select('ul.institution-list a')
+        print(f"      → DEBUG: Found {len(institution_links)} institution links after dropdown click")
+        
+        # Print all links for debugging
+        for idx, link in enumerate(institution_links):
+            link_text = link.get_text(strip=True)
+            href = link.get('href', '')
+            print(f"      → DEBUG: Link #{idx+1}: '{link_text}' → {href[:60] if href else 'NO HREF'}")
+        
+        # Find first (HS) link
+        for link in institution_links:
+            link_text = link.get_text(strip=True)
+            
+            if '(HS)' in link_text:
+                hs_url = link.get('href', '')
+                if not hs_url:
+                    print(f"      ⚠️  DEBUG: Found HS text but no href")
+                    continue
+                    
+                if hs_url.startswith('/'):
+                    hs_url = f"https://247sports.com{hs_url}"
+                    
+                hs_name = link_text.replace('(HS)', '').strip()
+                print(f"      ✅ DEBUG: Found HS profile!")
+                print(f"         Name: {hs_name}")
+                print(f"         URL: {hs_url}")
+                return (hs_url, hs_name)
+        
+        print(f"      ⚠️  DEBUG: No (HS) link found in {len(institution_links)} links")
+        return (None, None)
+        
+    except Exception as e:
+        print(f"      ❌ DEBUG: Exception: {e}")
+        import traceback
+        traceback.print_exc()
         return (None, None)
 
-    except Exception:
-        return (None, None)
+
+async def navigate_to_juco_profile_from_cover(page) -> bool:
+    """
+    For cover profiles (2022 and earlier), click the JUCO link using JavaScript.
+    Returns True if successfully navigated, False otherwise.
+    """
+    try:
+        print(f"      → DEBUG: Checking if this is a cover profile...")
+        
+        # Wait for page to render
+        await page.wait_for_timeout(2000)
+        
+        # Try to click JUCO dropdown using JavaScript
+        print(f"      → DEBUG: Attempting to click JUCO dropdown with JavaScript...")
+        try:
+            clicked = await page.evaluate('''() => {
+                // Look for the JUCO button/link in the institution selector
+                const jucoButton = document.querySelector('a[href*="JUCO"], button:has-text("JUCO")');
+                if (jucoButton) {
+                    jucoButton.click();
+                    return true;
+                }
+                return false;
+            }''')
+            
+            if clicked:
+                print(f"      ✓ DEBUG: Clicked JUCO button, waiting for dropdown...")
+                await page.wait_for_timeout(1500)
+            else:
+                print(f"      → DEBUG: No JUCO button found (might already be on JUCO profile)")
+                
+        except Exception as e:
+            print(f"      → DEBUG: JUCO button click attempt: {e}")
+        
+        # Now look for JUCO profile link in the dropdown
+        html = await page.content()
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Look for links containing (JUCO) and /junior-college-
+        all_links = soup.select('a')
+        for link in all_links:
+            link_text = link.get_text(strip=True)
+            href = link.get('href', '')
+            
+            if '(JUCO)' in link_text and '/junior-college-' in href:
+                juco_url = href
+                if juco_url.startswith('/'):
+                    juco_url = f"https://247sports.com{juco_url}"
+                
+                print(f"      ✓ DEBUG: Found JUCO profile link: {link_text}")
+                print(f"      → DEBUG: Navigating to: {juco_url[:70]}...")
+                
+                await page.goto(juco_url, wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(2000)
+                print(f"      ✓ DEBUG: Successfully loaded JUCO recruiting profile")
+                return True
+        
+        print(f"      → DEBUG: No JUCO profile link found (might already be on correct profile)")
+        return True
+        
+    except Exception as e:
+        print(f"      ⚠️  DEBUG: Error in navigate_to_juco_profile_from_cover: {e}")
+        return True  # Continue anyway
 
 async def parse_timeline(page, data, year, do_deep_dive: bool):
     try:
@@ -331,6 +424,7 @@ async def parse_timeline(page, data, year, do_deep_dive: bool):
                     except Exception: pass
     except Exception: pass
 
+# --- FIXED RANKING PARSER ---
 def parse_rankings_section_robust(soup, data, prefix_map, institution_check=None):
     """
     Robust ranking parser that handles the 247Sports Composite headers
@@ -403,11 +497,15 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
     data['_date_priority'] = -1
     
     try:
-        # --- 1. PARSE JUCO PROFILE ---
+        # --- 1. LOAD INITIAL PROFILE PAGE ---
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(1000)
-        await navigate_to_recruiting_profile(page)
+        await page.wait_for_timeout(2000)
         
+        # --- 2. CHECK FOR COVER PROFILE (2022 and earlier) ---
+        # Navigate to JUCO-specific profile if needed
+        await navigate_to_juco_profile_from_cover(page)
+        
+        # --- 3. NOW SCRAPE JUCO DATA ---
         html = await page.content()
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
@@ -442,7 +540,7 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
         
         data['Class'] = str(year)
         
-        # JUCO RANKINGS (Pass "JuniorCollege" as the institution check)
+        # JUCO RANKINGS
         juco_map = {"COMPOSITE": "Composite JUCO", "247SPORTS": "247 JUCO"}
         parse_rankings_section_robust(soup, data, juco_map, institution_check="JuniorCollege")
 
@@ -450,16 +548,21 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
         do_deep_dive = player_num <= DEEP_TIMELINE_LIMIT
         await parse_timeline(page, data, year, do_deep_dive)
 
-        # --- 2. FIND & PARSE HS PROFILE ---
+        # --- 3. NOW CLICK JUCO DROPDOWN TO GET HS PROFILE ---
+        # The dropdown is visible on initial page load
         hs_url, hs_name = await find_most_recent_hs_profile(page)
         
         if hs_url and hs_name:
             data['High School'] = hs_name
             try:
-                # Navigate to HS Profile
+                print(f"      → DEBUG: Clicking HS profile link: {hs_name}")
+                print(f"      → DEBUG: Navigating to: {hs_url[:60]}...")
+                
+                # Click the HS link - it will automatically load the recruiting profile
                 await page.goto(hs_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(1000)
-                await navigate_to_recruiting_profile(page)
+                await page.wait_for_timeout(2000)  # Wait for page to fully load
+                
+                # NO NEED to click "View recruiting profile" - it auto-loads
                 
                 hs_html = await page.content()
                 hs_soup = BeautifulSoup(hs_html, 'html.parser')
@@ -470,14 +573,18 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
                     text = item.get_text(strip=True)
                     if 'Class' in text:
                         match = re.search(r'Class[:\s]*(.*)', text, re.IGNORECASE)
-                        if match: data['HS Class Year'] = clean_text(match.group(1))
+                        if match: 
+                            data['HS Class Year'] = clean_text(match.group(1))
+                            print(f"      ✓ DEBUG: Found HS Class Year: {data['HS Class Year']}")
                 
-                # HS RANKINGS (Pass "HighSchool" as the institution check)
+                # HS RANKINGS
+                print(f"      → DEBUG: Parsing HS rankings...")
                 hs_map = {"COMPOSITE": "Composite HS", "247SPORTS": "247 HS"}
                 parse_rankings_section_robust(hs_soup, data, hs_map, institution_check="HighSchool")
+                print(f"      ✓ DEBUG: HS Rankings - 247: {data['247 HS Stars']}⭐ / Composite: {data['Composite HS Stars']}⭐")
                 
             except Exception as e:
-                print(f"      ⚠️  Could not load HS profile: {e}")
+                print(f"      ❌ DEBUG: Could not load HS profile: {e}")
 
         # Fallback for Signed Team
         if data['Signed Team'] == "NA":
@@ -536,7 +643,7 @@ async def scrape_player(page, url: str, year: int, player_num: int, total: int) 
 
 async def scrape_year(browser, year: int) -> list:
     print(f"\n{'='*80}")
-    print(f"🎓 SCRAPING {year} JUCO RECRUITING CLASS")
+    print(f"🎓 SCRAPING {year} JUCO RECRUITING CLASS (DEBUG MODE)")
     print(f"{'='*80}")
     player_urls = await click_load_more_until_complete(browser, year)
     if not player_urls:
@@ -574,7 +681,7 @@ async def scrape_year(browser, year: int) -> list:
 
 async def main():
     print("\n" + "="*80)
-    print("🏈 247SPORTS JUCO SCRAPER - FINAL VERSION")
+    print("🏈 247SPORTS JUCO SCRAPER - DEBUG VERSION")
     print("="*80)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     async with async_playwright() as p:
