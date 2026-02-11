@@ -397,12 +397,16 @@ async def navigate_to_juco_profile_from_cover(page) -> bool:
         # Wait for page to render
         await page.wait_for_timeout(2000)
         
-        # Try to click JUCO dropdown using JavaScript
+        # Try to click JUCO dropdown using JavaScript with valid selector
         print(f"      → DEBUG: Attempting to click JUCO dropdown with JavaScript...")
         try:
             clicked = await page.evaluate('''() => {
-                // Look for the JUCO button/link in the institution selector
-                const jucoButton = document.querySelector('a[href*="JUCO"], button:has-text("JUCO")');
+                // Find any element (a or button) that contains "JUCO" text
+                const elements = Array.from(document.querySelectorAll('a, button, div'));
+                const jucoButton = elements.find(el => {
+                    const text = el.textContent || '';
+                    return text.includes('JUCO') && !text.includes('(JUCO)');
+                });
                 if (jucoButton) {
                     jucoButton.click();
                     return true;
@@ -668,28 +672,39 @@ async def parse_profile(page, url: str, year: int, player_num: int, total: int) 
         do_deep_dive = player_num <= DEEP_TIMELINE_LIMIT
         await parse_timeline(page, data, year, do_deep_dive)
 
-        # --- 4. NOW CLICK JUCO DROPDOWN TO GET HS PROFILE ---
-        # Enhanced version with forced visibility
-        hs_url, hs_name, hs_id = await find_most_recent_hs_profile(page)
-        
-        if hs_url and hs_name:
-            data['High School'] = hs_name
-            # Update HS ID if we found it from the dropdown
-            if hs_id:
-                data['247 HS ID'] = hs_id
+        # --- 4. GET HS PROFILE USING DIRECT URL CONSTRUCTION ---
+        # We already extracted HS ID in step 2.5, so just build the URL directly
+        if data['247 HS ID'] != "NA":
+            hs_id = data['247 HS ID']
+            base_id = data['247 Base ID']
             
-            try:
-                print(f"      → DEBUG: Navigating to HS profile: {hs_name}")
-                print(f"      → DEBUG: URL: {hs_url[:60]}...")
+            # Extract player slug from URL
+            player_slug = None
+            slug_match = re.search(r'/player/([^/]+)-\d+', url)
+            if slug_match:
+                player_slug = slug_match.group(1)
+            
+            if player_slug and base_id:
+                hs_url = f"https://247sports.com/player/{player_slug}-{base_id}/high-school-{hs_id}/"
                 
-                # Navigate to HS profile
-                await page.goto(hs_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(2000)
+                try:
+                    print(f"      → DEBUG: Navigating to HS profile directly")
+                    print(f"      → DEBUG: URL: {hs_url[:80]}...")
+                    
+                    # Navigate to HS profile
+                    await page.goto(hs_url, wait_until='domcontentloaded', timeout=30000)
+                    await page.wait_for_timeout(2000)
                 
                 # NO NEED to click "View recruiting profile" - it auto-loads
                 
                 hs_html = await page.content()
                 hs_soup = BeautifulSoup(hs_html, 'html.parser')
+                
+                # HS School Name - extract from header
+                hs_institution = hs_soup.select_one('.institution, .team-name, h2.institution')
+                if hs_institution:
+                    data['High School'] = clean_text(hs_institution.get_text())
+                    print(f"      ✓ DEBUG: Found HS School: {data['High School']}")
                 
                 # HS Class Year
                 hs_header_items = hs_soup.select('.metrics-list li') + hs_soup.select('.details li') + hs_soup.select('ul.vitals li')
